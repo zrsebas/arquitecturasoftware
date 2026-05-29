@@ -1,23 +1,27 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from django.http import Http404
-from .application.services import PedidoService
-from .infra.factories import PagoFactory
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
+from django.http import JsonResponse
 from .serializers import PedidoSerializer, PedidoCreateSerializer
-from .models import Cliente, Producto, Inventario, Pedido
+from .models import Cliente, Producto, Pedido, DetallePedido
+import json
 
 
+@method_decorator(csrf_exempt, name='dispatch')
 class PedidoAPIView(APIView):
     """
-    APIView para el control total de peticiones de pedidos
-    Implementa manejo correcto de códigos de estado HTTP
+    APIView simple para pedidos
     """
+    
+    def dispatch(self, request, *args, **kwargs):
+        print(f"DEBUG: PedidoAPIView.dispatch called - method: {request.method}")
+        return super().dispatch(request, *args, **kwargs)
     
     def get(self, request, pedido_id=None):
         """
         GET /api/pedidos/ - Listar todos los pedidos
-        GET /api/pedidos/{id}/ - Obtener pedido específico
         """
         if pedido_id:
             try:
@@ -25,10 +29,7 @@ class PedidoAPIView(APIView):
                 serializer = PedidoSerializer(pedido)
                 return Response(serializer.data, status=status.HTTP_200_OK)
             except Pedido.DoesNotExist:
-                return Response(
-                    {"error": "Pedido no encontrado"}, 
-                    status=status.HTTP_404_NOT_FOUND
-                )
+                return Response({"error": "Pedido no encontrado"}, status=status.HTTP_404_NOT_FOUND)
         else:
             pedidos = Pedido.objects.all()
             serializer = PedidoSerializer(pedidos, many=True)
@@ -37,55 +38,73 @@ class PedidoAPIView(APIView):
     def post(self, request):
         """
         POST /api/pedidos/ - Crear nuevo pedido
-        Manejo de códigos: 201, 400, 404, 409
         """
-        serializer = PedidoCreateSerializer(data=request.data)
-        
-        if not serializer.is_valid():
-            return Response(
-                {"error": "Datos inválidos", "details": serializer.errors}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
         try:
+            print(f"DEBUG: Request body: {request.body}")
+            print(f"DEBUG: Request data: {request.data}")
+            data = json.loads(request.body)
+            cliente_id = data.get('cliente_id')
+            items = data.get('items', [])
+            
+            print(f"DEBUG: cliente_id: {cliente_id}")
+            print(f"DEBUG: items: {items}")
+            
+            if not cliente_id:
+                return Response({"error": "cliente_id es requerido"}, status=status.HTTP_400_BAD_REQUEST)
+            
+            if not items:
+                return Response({"error": "items es requerido"}, status=status.HTTP_400_BAD_REQUEST)
+            
             # Validar cliente existe
-            cliente = Cliente.objects.get(id=serializer.validated_data['cliente_id'])
+            try:
+                cliente = Cliente.objects.get(id=cliente_id)
+            except Cliente.DoesNotExist:
+                return Response({"error": "Cliente no encontrado"}, status=status.HTTP_404_NOT_FOUND)
             
-            # Validar items
-            items = serializer.validated_data['items']
+            # Crear pedido
+            pedido = Pedido.objects.create(
+                cliente=cliente,
+                estado='pendiente',
+                total=0
+            )
+            
+            print(f"DEBUG: Pedido creado con ID: {pedido.id}")
+            
+            # Crear detalles y calcular total
+            total = 0
             for item in items:
-                producto = Producto.objects.get(id=item['producto_id'])
-                if not Inventario.verificar_stock(producto, item['cantidad']):
-                    return Response(
-                        {"error": f"Stock insuficiente para producto {producto.nombre}"}, 
-                        status=status.HTTP_409_CONFLICT
-                    )
+                producto_id = item.get('producto_id')
+                cantidad = item.get('cantidad', 1)
+                
+                print(f"DEBUG: Procesando item - producto_id: {producto_id}, cantidad: {cantidad}")
+                
+                try:
+                    producto = Producto.objects.get(id=producto_id)
+                except Producto.DoesNotExist:
+                    return Response({"error": f"Producto {producto_id} no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+                
+                subtotal = float(producto.precio) * cantidad
+                total += subtotal
+                
+                DetallePedido.objects.create(
+                    pedido=pedido,
+                    producto=producto,
+                    cantidad=cantidad,
+                    precio_unitario=producto.precio
+                )
+                
+                print(f"DEBUG: Detalle creado - subtotal: {subtotal}")
             
-            # Procesar pedido
-            service = PedidoService(pago_processor=PagoFactory.create())
-            pedido = service.procesar_pedido(
-                cliente_id=serializer.validated_data['cliente_id'],
-                items=items
-            )
+            print(f"DEBUG: Total calculado: {total}")
+            # Actualizar total del pedido
+            pedido.total = total
+            pedido.save()
             
-            response_serializer = PedidoSerializer(pedido)
-            return Response(
-                response_serializer.data, 
-                status=status.HTTP_201_CREATED
-            )
+            serializer = PedidoSerializer(pedido)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
             
-        except Cliente.DoesNotExist:
-            return Response(
-                {"error": "Cliente no encontrado"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
-        except Producto.DoesNotExist:
-            return Response(
-                {"error": "Producto no encontrado"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
         except Exception as e:
-            return Response(
-                {"error": str(e)}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            print(f"DEBUG: Exception: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
